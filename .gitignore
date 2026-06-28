@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+venv/
+
+# Spark
+/tmp/
+*.crc
+spark-warehouse/
+checkpoints/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
