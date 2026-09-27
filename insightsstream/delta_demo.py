@@ -75,3 +75,7 @@ def main() -> None:
         if key.endswith("_last_checkpoint") or "_delta_log/" in key:
             continue
         print(f"  {key}")
+
+
+if __name__ == "__main__":
+    main()

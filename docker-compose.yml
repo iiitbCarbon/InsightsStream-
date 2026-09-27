@@ -58,7 +58,7 @@ services:
       - minio
     command: python -m streamlit run dashboard/delta_app.py --server.address=0.0.0.0
     ports:
-      - "127.0.0.1:8501:8501"
+      - "127.0.0.1:${DASHBOARD_PORT:-8501}:8501"
     environment: *lakehouse-environment
     volumes:
       - .:/workspace

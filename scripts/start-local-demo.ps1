@@ -3,12 +3,14 @@ param(
     [int]$Days = 7,
     [double]$InvalidRate = 0.01,
     [double]$DuplicateRate = 0.02,
-    [int]$Seed = 42
+    [int]$Seed = 42,
+    [int]$DashboardPort = 8501
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
+$env:DASHBOARD_PORT = $DashboardPort
 
 docker compose up -d --build zookeeper kafka minio notebook dashboard
 if ($LASTEXITCODE -ne 0) {
@@ -50,4 +52,4 @@ Write-Host "MinIO objects: http://localhost:9001"
 Write-Host "  username: insights"
 Write-Host "  password: insights-local"
 Write-Host "Jupyter Lab:  http://localhost:8888"
-Write-Host "Dashboard:    http://localhost:8501"
+Write-Host "Dashboard:    http://localhost:$DashboardPort"
