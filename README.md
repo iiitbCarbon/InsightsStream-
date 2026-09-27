@@ -1,187 +1,241 @@
 # InsightsStream
 
-InsightsStream is a portfolio-ready data engineering project that demonstrates two complementary data paths:
+InsightsStream is a fully local data-engineering demonstration built around:
 
-1. a **PySpark + Spark SQL notebook-driven medallion lakehouse** that ingests source files, stores
-   bronze/silver/gold data in local object storage or Cloudflare R2, publishes processed data, and powers a
-   Streamlit dashboard;
-2. the original **real-time Kafka + PySpark path** for streaming events into PostgreSQL and FastAPI.
+- **batch ingestion** from a generated CSV source;
+- **continuous ingestion** from Kafka;
+- **PySpark and Spark SQL** transformations;
+- **real Delta Lake tables** with transaction logs;
+- **MinIO** as a local S3-compatible object store;
+- **Jupyter notebooks** for each pipeline stage;
+- a **Streamlit dashboard** over the gold Delta table.
 
-The local lakehouse path is the default, so the full demonstration works without an account, credit card, or
-cloud credentials. Cloudflare R2 uses the same code through its S3-compatible API.
+No cloud account or payment method is required.
 
-## Lakehouse architecture
+## Architecture
 
 ```mermaid
 flowchart LR
-    SRC[CSV / JSON / JSONL / Parquet source]
-    N1[01 PySpark bronze notebook]
-    B[(Bronze<br/>immutable Parquet)]
-    N2[02 PySpark + SQL silver notebook]
-    S[(Silver<br/>typed + deduplicated)]
-    Q[(Quarantine<br/>invalid records)]
-    N3[03 PySpark + SQL gold notebook]
-    G[(Gold<br/>daily metrics)]
-    OUT[(Processed export<br/>clean CSV)]
-    N4[04 Exploration notebook]
-    DASH[Streamlit dashboard]
+    GEN[Dummy source generator] --> CSV[generated_events.csv]
+    CSV --> SRC[(MinIO source/)]
+    SRC --> BATCH[PySpark batch ingestion]
 
-    SRC --> N1 --> B --> N2
-    N2 --> S
-    N2 --> Q
-    S --> N3
-    N3 --> G
-    N3 --> OUT
-    G --> N4
-    G --> DASH
+    PROD[Dummy event producer] --> K[(Kafka events)]
+    K --> STREAM[PySpark Structured Streaming]
+
+    BATCH --> BRONZE[(Bronze Delta)]
+    STREAM --> BRONZE
+    BRONZE --> SILVER[Spark SQL validation + dedup]
+    SILVER --> SD[(Silver Delta)]
+    SILVER --> Q[(Quarantine Delta)]
+    SD --> GOLD[Spark SQL aggregation]
+    GOLD --> GD[(Gold Delta)]
+    SD --> PD[(Processed Delta)]
+    GD --> DASH[Streamlit dashboard]
 ```
 
-Each object is stored under a visible, auditable prefix:
+Both source types converge in `bronze/events`. The `source_type` column identifies `batch` versus `stream`
+records. Every Delta table contains a `_delta_log/` prefix, proving that it is Delta rather than a folder of plain
+Parquet files.
+
+## One-command local demo
+
+Requirements:
+
+- Docker Desktop
+- PowerShell
+
+Run:
+
+```powershell
+Set-Location "C:\Users\habba\OneDrive\Desktop\InsightsStream"
+.\scripts\start-local-demo.ps1 -Rows 1000
+```
+
+This command:
+
+1. starts Kafka, MinIO, Jupyter, and Streamlit in Docker;
+2. generates `data/source/generated_events.csv`;
+3. uploads the source CSV to MinIO;
+4. appends the batch to the bronze Delta table;
+5. builds silver and quarantine Delta tables;
+6. builds gold and processed Delta tables.
+
+Open:
+
+| UI | URL | Credentials |
+|---|---|---|
+| MinIO object browser | http://localhost:9001 | `insights` / `insights-local` |
+| Jupyter Lab | http://localhost:8888 | No token |
+| Streamlit dashboard | http://localhost:8501 | None |
+
+The credentials are intentionally local development credentials and must not be reused outside this Docker stack.
+The MinIO, Jupyter, dashboard, and host Kafka ports are bound to `127.0.0.1`, so the no-token development UIs are
+not exposed to other machines on the network.
+
+## What to show an interviewer
+
+### 1. Source
+
+The generator is `producer/generate_source.py`.
+
+The generated source is visible in two places:
 
 ```text
-bronze/events/ingestion_date=YYYY-MM-DD/batch_id=<id>/events.parquet
-silver/events/batch_id=<id>/events_clean.parquet
-quarantine/events/batch_id=<id>/rejected.parquet
-gold/daily_metrics/batch_id=<id>/daily_metrics.parquet
-processed/batch_id=<id>/events_processed.csv
-metadata/runs/<id>.json
-metadata/latest.json
+Windows:
+data/source/generated_events.csv
+
+MinIO:
+insightsstream/source/generated_events.csv
 ```
 
-## What the pipeline demonstrates
+### 2. Raw Delta data
 
-| Stage | Behavior |
-|---|---|
-| Source | Accepts CSV, JSON, JSONL/NDJSON, or Parquet with `entity_id`, `metric`, `value`, and `ts` |
-| Bronze | Preserves source fields and adds batch, source, and ingestion metadata |
-| Silver | Standardizes fields, parses UTC timestamps and numbers, deduplicates events, and derives date/hour |
-| Quarantine | Separates invalid required fields instead of silently discarding them |
-| Gold | Produces daily event count, total value, unique entities, and average value by metric |
-| Processed | Delivers cleaned event-level data as CSV for a downstream system |
-| Metadata | Records row counts, object locations, timestamps, and latest-run state |
-| Dashboard | Reads the latest gold object from the same configured storage backend |
+Open the `insightsstream` bucket in MinIO and navigate to:
 
-## Quick start: free local demo
+```text
+bronze/events/
+├── _delta_log/
+└── ingestion_date=YYYY-MM-DD/
+    └── part-....snappy.parquet
+```
 
-Python 3.11 is recommended.
+`_delta_log` contains the ACID transaction history. Bronze contains unchanged event values plus ingestion,
+source, batch, and Kafka-offset metadata.
+
+### 3. Clean and rejected data
+
+```text
+silver/events/       # typed, standardized, deduplicated records
+quarantine/events/   # invalid records with rejection reason
+```
+
+### 4. Aggregated and delivered data
+
+```text
+gold/daily_metrics/  # dashboard-ready metrics
+processed/events/    # clean event-level downstream Delta table
+```
+
+### 5. Inspect the layout from a terminal
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-
-# Run all medallion stages against the included source.
-python -m insightsstream.cli data\source\sample_events.csv
-
-# Inspect the dashboard.
-streamlit run dashboard\app.py
-
-# Or open and run notebooks 01 through 04 in order.
-jupyter lab
+docker compose exec -T notebook python -m insightsstream.inspect_lake
 ```
 
-The generated lake is under `data/lakehouse/` and is intentionally ignored by Git.
-PySpark is the default CLI engine. A lightweight compatibility run is also available with `--engine pandas`.
+## Batch versus continuous ingestion
 
-## Use your own source
+### Batch
 
-Provide a CSV, JSON, JSONL, or Parquet file containing:
-
-| Column | Meaning | Example |
-|---|---|---|
-| `entity_id` | User, device, or business entity | `user_001` |
-| `metric` | Event or measure name | `page_views` |
-| `value` | Numeric measure | `1` or `49.99` |
-| `ts` | ISO-8601 event timestamp | `2026-09-27T10:00:00Z` |
-
-Then run:
+The one-command demo runs the batch path. To generate a different volume:
 
 ```powershell
-python -m insightsstream.cli C:\path\to\your_events.csv
+.\scripts\start-local-demo.ps1 `
+  -Rows 10000 `
+  -Days 30 `
+  -InvalidRate 0.01 `
+  -DuplicateRate 0.02 `
+  -Seed 42
 ```
 
-Column names are trimmed and lowercased. Invalid required values are written to quarantine, and repeated events
-with the same entity, metric, and timestamp are deduplicated in silver.
+The batch generator deliberately supports invalid and duplicate events so the silver and quarantine behavior is
+visible.
 
-## Free hosted storage: Cloudflare R2
+### Continuous Kafka
 
-R2 is useful for a portfolio demo because it has an S3-compatible API and a web dashboard where the medallion
-prefixes and output objects can be inspected. Check Cloudflare's current pricing page before use because free-tier
-terms can change.
-
-1. Create an R2 bucket named `insightsstream` in the Cloudflare dashboard.
-2. Create an R2 API token with **Object Read & Write** access limited to that bucket.
-3. Copy `.env.example` to `.env`, but do not commit `.env`.
-4. Fill in the R2 values and change `INSIGHTS_STORAGE_BACKEND` to `r2`.
-5. Run the pipeline:
+After the stack is running, generate Kafka events for 15 seconds:
 
 ```powershell
-python -m insightsstream.cli data\source\sample_events.csv
-streamlit run dashboard\app.py
+python producer\produce_events.py --events-per-second 25 --duration 15
 ```
 
-The notebooks and dashboard automatically use R2 when these variables are present. A successful pipeline run will
-show the `bronze/`, `silver/`, `gold/`, `quarantine/`, `processed/`, and `metadata/` prefixes in the R2 web console.
-The repository does not connect to your R2 account until you provide these credentials locally. Credentials are
-never stored inside a notebook or source file.
+Then open `notebooks/00_kafka_to_bronze.ipynb` in Jupyter and run all cells. The available Kafka offsets are
+appended to the same bronze Delta table with:
+
+```text
+source_type = stream
+kafka_topic
+kafka_partition
+kafka_offset
+```
+
+After adding streaming records, rerun notebooks 02 and 03 to refresh silver, quarantine, gold, and processed
+tables.
 
 ## Notebook walkthrough
 
-The optional Kafka notebook and the four medallion notebooks contain PySpark DataFrame operations and executable
-Spark SQL queries; they do not use Pandas.
+Run in this order:
 
-1. `notebooks/00_kafka_to_bronze.ipynb` — optionally consume Kafka micro-batches with Structured Streaming.
-2. `notebooks/01_bronze_ingestion.ipynb` — show/profile a file source with Spark SQL and land the raw batch.
-3. `notebooks/02_bronze_to_silver.ipynb` — clean, validate, deduplicate, and quarantine with Spark SQL.
-4. `notebooks/03_silver_to_gold.ipynb` — aggregate with Spark SQL and publish processed event data.
-5. `notebooks/04_gold_exploration.ipynb` — run KPI and ranking SQL over the latest gold dataset.
+1. `notebooks/01_bronze_ingestion.ipynb` — generate/upload CSV and append batch data to bronze Delta.
+2. `notebooks/00_kafka_to_bronze.ipynb` — optionally append Kafka events with Structured Streaming.
+3. `notebooks/02_bronze_to_silver.ipynb` — validate and deduplicate with Spark SQL.
+4. `notebooks/03_silver_to_gold.ipynb` — create gold and processed Delta tables.
+5. `notebooks/04_gold_exploration.ipynb` — query KPIs and display Delta transaction histories.
 
-Business logic lives in `insightsstream/spark_pipeline.py` rather than being duplicated across cells. This makes
-the notebooks easy to explain while keeping the PySpark pipeline testable and usable from an orchestrator or CI
-job. The Pandas implementation remains as a lightweight fallback for machines without Java.
+All ETL notebook operations use PySpark or Spark SQL. Pandas is used only by Streamlit to render the small gold
+result in a browser.
 
-## Real-time streaming path
+## Generated object layout
 
-The original streaming prototype remains available:
-
-```mermaid
-flowchart LR
-    P[Python event producer] --> K[(Kafka)]
-    K --> SP[PySpark Structured Streaming]
-    SP --> PG[(PostgreSQL)]
-    PG --> API[FastAPI]
-    API --> C[Clients]
-    API <--> R[(Redis)]
+```text
+insightsstream/
+├── source/
+│   └── generated_events.csv
+├── bronze/events/
+│   ├── _delta_log/
+│   └── ingestion_date=.../
+├── silver/events/
+│   ├── _delta_log/
+│   └── event_date=.../
+├── quarantine/events/
+│   └── _delta_log/
+├── gold/daily_metrics/
+│   └── _delta_log/
+├── processed/events/
+│   ├── _delta_log/
+│   └── event_date=.../
+├── checkpoints/kafka-to-bronze/
+└── metadata/latest.json
 ```
+
+## Stop or reset
+
+Stop containers while retaining MinIO data:
 
 ```powershell
-docker compose up -d
-python producer\produce_events.py
-python processing\stream_job.py
+docker compose down
 ```
 
-See `docs/architecture.md` for how the batch and stream paths fit together.
+The next `start-local-demo.ps1` run resets project objects by default and creates a clean demonstration. To append
+another batch instead:
 
-## Test
+```powershell
+docker compose exec -T notebook python -m insightsstream.delta_demo --rows 1000 --keep-existing
+```
+
+Remove containers and the MinIO volume:
+
+```powershell
+docker compose down -v
+```
+
+## Tests
 
 ```powershell
 python -m pytest tests
+docker compose config
 ```
 
-## Repository structure
+## Main project files
 
 ```text
-InsightsStream/
-├── insightsstream/          # PySpark pipeline, fallback pipeline, and storage adapters
-├── notebooks/               # Kafka, bronze, silver, gold, and SQL notebooks
-├── dashboard/app.py         # Streamlit dashboard
-├── data/source/             # committed example input only
-├── tests/                   # pipeline tests
-├── producer/                # Kafka event producer
-├── processing/              # PySpark streaming job
-├── api/                     # FastAPI serving API
-├── infra/                   # PostgreSQL initialization
-├── docs/                    # architecture and scalability details
-├── .env.example             # local/R2 configuration template
-└── requirements.txt
+docker-compose.yml                   # Kafka, MinIO, Jupyter, dashboard
+scripts/start-local-demo.ps1         # one-command interviewer demo
+producer/generate_source.py          # batch dummy-data generator
+producer/produce_events.py           # continuous Kafka producer
+insightsstream/delta_pipeline.py     # batch + streaming Delta logic
+insightsstream/delta_demo.py         # generated source to complete lakehouse
+insightsstream/inspect_lake.py        # visible object-layout report
+notebooks/                            # PySpark and Spark SQL walkthrough
+dashboard/delta_app.py               # gold Delta dashboard
 ```

@@ -369,8 +369,13 @@ def run_pipeline(
     store: ObjectStore | None = None,
     batch_id: str | None = None,
 ) -> PipelineRun:
+    owns_spark_session = spark is None
     resolved_spark = spark or create_spark_session()
     object_store = store or create_store()
-    run = ingest_source(source_path, resolved_spark, object_store, batch_id)
-    transform_silver(run.batch_id, resolved_spark, object_store)
-    return build_gold(run.batch_id, resolved_spark, object_store)
+    try:
+        run = ingest_source(source_path, resolved_spark, object_store, batch_id)
+        transform_silver(run.batch_id, resolved_spark, object_store)
+        return build_gold(run.batch_id, resolved_spark, object_store)
+    finally:
+        if owns_spark_session:
+            resolved_spark.stop()

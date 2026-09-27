@@ -19,4 +19,5 @@ checkpoints/
 # Local data lake and secrets
 data/lakehouse/
 data/checkpoints/
+data/source/generated_*.csv
 .env

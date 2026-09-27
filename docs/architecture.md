@@ -1,114 +1,113 @@
 # Architecture Deep Dive
 
-## 1. Two processing paths
+## Unified local lakehouse
 
-InsightsStream uses one event model across two paths:
+InsightsStream runs entirely on a developer machine with Docker:
 
-- The **batch lakehouse path** is the primary portfolio demonstration. It uses PySpark DataFrames and Spark SQL,
-  is notebook-driven, inspectable in object storage, and feeds a visual dashboard.
-- The **streaming path** demonstrates Kafka buffering, Structured Streaming windows, and low-latency API serving.
+| Component | Role |
+|---|---|
+| Kafka | Replayable continuous event source |
+| MinIO | Local S3-compatible source and Delta object storage |
+| Jupyter | Interactive PySpark and Spark SQL execution |
+| Delta Lake | ACID transaction log, schema enforcement, batch/stream unification |
+| Streamlit | Dashboard over the gold Delta table |
 
-In a production design, Kafka events can also be archived to the bronze prefix so both paths converge on one
-governed lake.
+The design intentionally gives batch and streaming events the same bronze schema.
 
 ```mermaid
 flowchart TB
-    FS[Files] --> MED[Notebook medallion pipeline]
-    APP[Applications / devices] --> K[(Kafka)]
-    K --> STREAM[PySpark streaming]
-    K -. future archive sink .-> MED
-    MED --> OBJ[(Local object store / R2)]
-    STREAM --> PG[(PostgreSQL)]
-    OBJ --> SD[Streamlit dashboard]
-    PG --> API[FastAPI]
+    CSV[Generated CSV] --> MINIOSRC[(MinIO source)]
+    MINIOSRC --> BATCH[PySpark batch read]
+    EVENTS[Event producer] --> K[(Kafka)]
+    K --> SS[Structured Streaming]
+    BATCH --> B[(Bronze Delta)]
+    SS --> B
+    B --> SQL[Silver Spark SQL]
+    SQL --> S[(Silver Delta)]
+    SQL --> Q[(Quarantine Delta)]
+    S --> AGG[Gold Spark SQL]
+    AGG --> G[(Gold Delta)]
+    S --> P[(Processed Delta)]
+    G --> D[Streamlit]
 ```
 
-## 2. Medallion pipeline
+## Source contract
+
+Both sources produce:
+
+| Field | Type in bronze | Meaning |
+|---|---|---|
+| `entity_id` | string | User, device, or business entity |
+| `metric` | string | Event type or measure |
+| `value` | string | Raw measure, typed in silver |
+| `ts` | string | Raw event time, typed in silver |
+
+Bronze adds `ingested_at`, `ingestion_date`, `source_type`, `source_name`, and `batch_id`. Streaming rows also
+contain Kafka topic, partition, and offset, which provide replay and traceability.
+
+## Delta layers
+
+### Source
+
+The generated CSV remains visible on Windows and is uploaded under `source/` in MinIO. This separates source
+delivery from lake ingestion and makes the pull step explicit.
 
 ### Bronze
 
-Bronze is append-only and batch-addressable. The pipeline validates only that the four contract columns exist,
-then retains their values and adds:
-
-- `batch_id`
-- `source_file`
-- `ingested_at`
-
-Parquet preserves types efficiently and gives the later PySpark stages column pruning and compression.
+`bronze/events` is append-only. Batch and streaming writes create Delta commits under `bronze/events/_delta_log`.
+Raw values are retained so silver rules can change without regenerating source data.
 
 ### Silver and quarantine
 
-Silver applies the data contract through Spark SQL:
+Spark SQL:
 
-- identifiers and metric names are trimmed;
-- metric names are lowercased;
-- values are converted to numeric;
-- timestamps are converted to UTC;
-- duplicate `(entity_id, metric, event_ts)` records are removed;
-- `event_date` and `event_hour` are derived.
+- trims identifiers;
+- lowercases metric names;
+- casts values to double;
+- parses timestamps in UTC;
+- derives event date and hour;
+- deduplicates by entity, metric, and event timestamp.
 
-Rows that cannot satisfy required fields are written under `quarantine/`. The run manifest records accepted and
-rejected counts, making data quality visible instead of silently hiding failures.
+Invalid required values are written to `quarantine/events`. Valid records are partitioned by event date in
+`silver/events`.
 
-### Gold and processed output
+### Gold
 
-Gold uses Spark SQL to aggregate by event date and metric:
+`gold/daily_metrics` contains event counts, total values, unique entities, and average values grouped by event date
+and metric.
 
-- event count;
-- total value;
-- unique entities;
-- average value.
+### Processed
 
-The gold Parquet object feeds notebook exploration and Streamlit. A cleaned event-level CSV is separately written
-under `processed/` as the downstream delivery artifact requested by consumers.
+`processed/events` is a Delta delivery table containing the clean event-level records. It represents the
+post-processing handoff to another application, model, or data warehouse.
 
-### Run metadata
+## Batch behavior
 
-Every batch has `metadata/runs/<batch_id>.json`. `metadata/latest.json` points notebooks and the dashboard at the
-current batch without embedding storage paths in UI code.
+The batch demo generates a CSV, uploads it to MinIO, and appends it to bronze. Silver, quarantine, gold, and
+processed are rebuilt from the complete bronze snapshot. `--keep-existing` demonstrates repeated batch ingestion;
+the default clean demo removes previous project objects first.
 
-## 3. Storage abstraction
+## Streaming behavior
 
-The pipeline depends on four object-store operations: put, get, exists, and list. Implementations are:
+Structured Streaming reads Kafka and appends directly to the same bronze Delta path. Its checkpoint is stored in
+MinIO under `checkpoints/kafka-to-bronze`, so offsets survive notebook restarts. Kafka metadata is retained in
+bronze for auditability.
 
-| Backend | Purpose | Selection |
-|---|---|---|
-| Local filesystem | Free development, tests, offline presentation | `INSIGHTS_STORAGE_BACKEND=local` |
-| Cloudflare R2 | Hosted, web-visible portfolio demonstration | `INSIGHTS_STORAGE_BACKEND=r2` |
+The notebook uses an `availableNow` trigger for an interview-friendly bounded run: produce events for a fixed
+duration, stop the producer, then drain all available offsets. The same function also supports a ten-second
+continuous processing trigger.
 
-R2 uses `boto3` against Cloudflare's S3-compatible endpoint. PySpark writes Parquet/CSV stage files and the object
-adapter transfers those files to R2, avoiding cloud credentials in notebooks. The adapter can later support AWS
-S3 by changing endpoint and credential configuration without changing transformations.
+## Why MinIO
 
-## 4. Idempotency and replay
+MinIO keeps the project free and local while preserving the object-store layout used by S3-compatible platforms.
+Its browser UI makes source files, Parquet data files, partitions, checkpoints, and Delta transaction logs easy to
+show during an interview.
 
-A generated batch ID makes normal runs append-only. An orchestrator can pass a stable `--batch-id`; rerunning it
-replaces the same object keys rather than creating ambiguous duplicates. Bronze remains available, so silver and
-gold can be rebuilt independently through notebooks.
+## Production extensions
 
-## 5. Streaming path
-
-```mermaid
-flowchart LR
-    A[Event sources] --> P[Keyed producer]
-    P --> K{{Kafka events topic}}
-    K --> S[Structured Streaming]
-    S --> DB[(PostgreSQL)]
-    DB --> API[FastAPI]
-    API <--> REDIS[(Redis)]
-```
-
-Events are keyed by `entity_id` for per-entity ordering. Spark uses a two-minute watermark and one-minute tumbling
-windows. Kafka offsets and Spark checkpoints support recovery. The existing PostgreSQL/Redis/FastAPI path is kept
-separate from the batch dashboard so the zero-cost lakehouse demo has no infrastructure dependency.
-
-## 6. Production extensions
-
-The next scale-up steps would be:
-
-1. use Airflow, Dagster, or a managed scheduler to invoke the same stage functions;
-2. add a Kafka-to-bronze archive sink;
-3. use Apache Iceberg or Delta Lake for ACID tables and schema evolution;
-4. add a catalog, lineage, and data-quality alerting;
-5. compact small files and apply lifecycle policies;
-6. serve cumulative gold tables instead of only the latest demonstration batch.
+1. Replace MinIO endpoints and credentials with managed object storage.
+2. Run Spark on a cluster rather than the single local Jupyter container.
+3. Use a metastore/catalog for named Delta tables and governance.
+4. Schedule silver/gold refreshes or make them continuous streaming tables.
+5. Add expectations and alerts for quarantine thresholds.
+6. Compact small files and configure retention/VACUUM policies.
