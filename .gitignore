@@ -15,3 +15,8 @@ checkpoints/
 .DS_Store
 .idea/
 .vscode/
+
+# Local data lake and secrets
+data/lakehouse/
+data/checkpoints/
+.env

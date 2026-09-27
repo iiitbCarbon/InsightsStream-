@@ -1,0 +1,11 @@
+entity_id,metric,value,ts
+user_001,page_views,1,2026-09-26T08:00:00Z
+user_001,clicks,1,2026-09-26T08:02:00Z
+user_002,page_views,1,2026-09-26T08:03:00Z
+user_003,purchases,49.99,2026-09-26T08:07:00Z
+user_004,signups,1,2026-09-26T09:01:00Z
+user_005,page_views,1,2026-09-27T10:00:00Z
+user_005,clicks,1,2026-09-27T10:01:00Z
+user_006,purchases,79.50,2026-09-27T10:05:00Z
+user_007,page_views,1,2026-09-27T11:00:00Z
+,clicks,1,not-a-timestamp

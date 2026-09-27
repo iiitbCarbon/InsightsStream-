@@ -1,59 +1,114 @@
-# Architecture Deep-Dive
+# Architecture Deep Dive
 
-This document expands on the design of InsightsStream beyond the README overview.
+## 1. Two processing paths
 
-## 1. Ingestion Layer
+InsightsStream uses one event model across two paths:
 
-```mermaid
-flowchart LR
-    A[Event Sources] --> B[Producer<br/>key = entity_id]
-    B --> C{{Kafka topic: events<br/>6 partitions, RF=1 local}}
-```
+- The **batch lakehouse path** is the primary portfolio demonstration. It uses PySpark DataFrames and Spark SQL,
+  is notebook-driven, inspectable in object storage, and feeds a visual dashboard.
+- The **streaming path** demonstrates Kafka buffering, Structured Streaming windows, and low-latency API serving.
 
-**Why Kafka?** It decouples producers from consumers and acts as a durable, replayable buffer. If the
-processing layer goes down, events accumulate in Kafka rather than being lost, and Spark resumes from its
-last committed offset on restart.
-
-**Partitioning strategy:** events are keyed by `entity_id`. This guarantees that all events for a given
-entity land on the same partition (preserving order) while spreading load evenly across partitions.
-
-## 2. Processing Layer
+In a production design, Kafka events can also be archived to the bronze prefix so both paths converge on one
+governed lake.
 
 ```mermaid
 flowchart TB
-    K[(Kafka)] --> R[readStream]
-    R --> P[parse JSON + schema]
-    P --> W[withWatermark 2 min]
-    W --> G[groupBy 1-min window, metric]
-    G --> U[foreachBatch upsert]
-    U --> DB[(PostgreSQL)]
+    FS[Files] --> MED[Notebook medallion pipeline]
+    APP[Applications / devices] --> K[(Kafka)]
+    K --> STREAM[PySpark streaming]
+    K -. future archive sink .-> MED
+    MED --> OBJ[(Local object store / R2)]
+    STREAM --> PG[(PostgreSQL)]
+    OBJ --> SD[Streamlit dashboard]
+    PG --> API[FastAPI]
 ```
 
-- **Watermarking** (`2 minutes`) bounds state so late events are still counted but state doesn't grow forever.
-- **Tumbling 1-minute windows** produce deterministic per-minute aggregates.
-- **`foreachBatch` + UPSERT** makes writes idempotent: replays after failure overwrite rather than duplicate.
-- **Checkpointing** persists offsets and state for exactly-once-style recovery.
+## 2. Medallion pipeline
 
-## 3. Serving Layer
+### Bronze
+
+Bronze is append-only and batch-addressable. The pipeline validates only that the four contract columns exist,
+then retains their values and adds:
+
+- `batch_id`
+- `source_file`
+- `ingested_at`
+
+Parquet preserves types efficiently and gives the later PySpark stages column pruning and compression.
+
+### Silver and quarantine
+
+Silver applies the data contract through Spark SQL:
+
+- identifiers and metric names are trimmed;
+- metric names are lowercased;
+- values are converted to numeric;
+- timestamps are converted to UTC;
+- duplicate `(entity_id, metric, event_ts)` records are removed;
+- `event_date` and `event_hour` are derived.
+
+Rows that cannot satisfy required fields are written under `quarantine/`. The run manifest records accepted and
+rejected counts, making data quality visible instead of silently hiding failures.
+
+### Gold and processed output
+
+Gold uses Spark SQL to aggregate by event date and metric:
+
+- event count;
+- total value;
+- unique entities;
+- average value.
+
+The gold Parquet object feeds notebook exploration and Streamlit. A cleaned event-level CSV is separately written
+under `processed/` as the downstream delivery artifact requested by consumers.
+
+### Run metadata
+
+Every batch has `metadata/runs/<batch_id>.json`. `metadata/latest.json` points notebooks and the dashboard at the
+current batch without embedding storage paths in UI code.
+
+## 3. Storage abstraction
+
+The pipeline depends on four object-store operations: put, get, exists, and list. Implementations are:
+
+| Backend | Purpose | Selection |
+|---|---|---|
+| Local filesystem | Free development, tests, offline presentation | `INSIGHTS_STORAGE_BACKEND=local` |
+| Cloudflare R2 | Hosted, web-visible portfolio demonstration | `INSIGHTS_STORAGE_BACKEND=r2` |
+
+R2 uses `boto3` against Cloudflare's S3-compatible endpoint. PySpark writes Parquet/CSV stage files and the object
+adapter transfers those files to R2, avoiding cloud credentials in notebooks. The adapter can later support AWS
+S3 by changing endpoint and credential configuration without changing transformations.
+
+## 4. Idempotency and replay
+
+A generated batch ID makes normal runs append-only. An orchestrator can pass a stable `--batch-id`; rerunning it
+replaces the same object keys rather than creating ambiguous duplicates. Bronze remains available, so silver and
+gold can be rebuilt independently through notebooks.
+
+## 5. Streaming path
 
 ```mermaid
 flowchart LR
-    Client --> API[FastAPI async]
-    API -->|cache hit| Redis[(Redis)]
-    API -->|cache miss| PG[(PostgreSQL<br/>indexed read)]
-    PG --> API
-    API --> Client
+    A[Event sources] --> P[Keyed producer]
+    P --> K{{Kafka events topic}}
+    K --> S[Structured Streaming]
+    S --> DB[(PostgreSQL)]
+    DB --> API[FastAPI]
+    API <--> REDIS[(Redis)]
 ```
 
-The API is stateless and async. Reads hit Redis first; on a miss it runs an indexed PostgreSQL query and
-backfills the cache with a short TTL. Stateless design means API replicas scale horizontally behind a load
-balancer.
+Events are keyed by `entity_id` for per-entity ordering. Spark uses a two-minute watermark and one-minute tumbling
+windows. Kafka offsets and Spark checkpoints support recovery. The existing PostgreSQL/Redis/FastAPI path is kept
+separate from the batch dashboard so the zero-cost lakehouse demo has no infrastructure dependency.
 
-## Failure Modes & Handling
+## 6. Production extensions
 
-| Failure | Behavior |
-|---------|----------|
-| Producer crash | Kafka retains prior events; resume on restart |
-| Spark crash | Restarts from checkpointed offsets; idempotent upserts prevent dupes |
-| Postgres slow | Redis absorbs hot reads; backpressure caps Spark intake |
-| Traffic spike | Kafka buffers; `maxOffsetsPerTrigger` smooths processing |
+The next scale-up steps would be:
+
+1. use Airflow, Dagster, or a managed scheduler to invoke the same stage functions;
+2. add a Kafka-to-bronze archive sink;
+3. use Apache Iceberg or Delta Lake for ACID tables and schema evolution;
+4. add a catalog, lineage, and data-quality alerting;
+5. compact small files and apply lifecycle policies;
+6. serve cumulative gold tables instead of only the latest demonstration batch.

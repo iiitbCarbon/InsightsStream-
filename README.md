@@ -1,205 +1,187 @@
-# InsightsStream — Real-Time Data Analytics Platform
+# InsightsStream
 
-> A scalable, end-to-end streaming data platform that ingests high-volume event data through **Apache Kafka**, processes it in real time with **PySpark Structured Streaming**, persists it into a partitioned analytics store, and serves low-latency insights via a **FastAPI** service.
+InsightsStream is a portfolio-ready data engineering project that demonstrates two complementary data paths:
 
-[![Python](https://img.shields.io/badge/Python-3.11-blue)]()
-[![Kafka](https://img.shields.io/badge/Apache-Kafka-black)]()
-[![PySpark](https://img.shields.io/badge/Apache-Spark-orange)]()
-[![FastAPI](https://img.shields.io/badge/FastAPI-async-green)]()
-[![Docker](https://img.shields.io/badge/Docker-Compose-blue)]()
+1. a **PySpark + Spark SQL notebook-driven medallion lakehouse** that ingests source files, stores
+   bronze/silver/gold data in local object storage or Cloudflare R2, publishes processed data, and powers a
+   Streamlit dashboard;
+2. the original **real-time Kafka + PySpark path** for streaming events into PostgreSQL and FastAPI.
 
----
+The local lakehouse path is the default, so the full demonstration works without an account, credit card, or
+cloud credentials. Cloudflare R2 uses the same code through its S3-compatible API.
 
-## Table of Contents
-- [Overview](#overview)
-- [System Architecture](#system-architecture)
-- [Data Flow](#data-flow)
-- [Component Design](#component-design)
-- [Scalability Considerations](#scalability-considerations)
-- [Design Decisions](#design-decisions)
-- [Tech Stack](#tech-stack)
-- [Local Setup](#local-setup)
-- [Repository Structure](#repository-structure)
-
----
-
-## Overview
-
-InsightsStream simulates a production-grade analytics pipeline handling **1M+ events/day**. It demonstrates the
-patterns that separate a hobby project from a real platform: decoupled ingestion, horizontally scalable stream
-processing, idempotent writes, partitioned storage, and an API layer with caching.
-
-**Use case:** clickstream / IoT telemetry ingestion → real-time aggregation (per-minute metrics, top-N entities)
-→ queryable insights for dashboards.
-
----
-
-## System Architecture
+## Lakehouse architecture
 
 ```mermaid
 flowchart LR
-    subgraph Sources["Event Sources"]
-        P1[Web / App Events]
-        P2[IoT Telemetry]
-    end
+    SRC[CSV / JSON / JSONL / Parquet source]
+    N1[01 PySpark bronze notebook]
+    B[(Bronze<br/>immutable Parquet)]
+    N2[02 PySpark + SQL silver notebook]
+    S[(Silver<br/>typed + deduplicated)]
+    Q[(Quarantine<br/>invalid records)]
+    N3[03 PySpark + SQL gold notebook]
+    G[(Gold<br/>daily metrics)]
+    OUT[(Processed export<br/>clean CSV)]
+    N4[04 Exploration notebook]
+    DASH[Streamlit dashboard]
 
-    subgraph Ingestion["Ingestion Layer"]
-        PR[Python Producer<br/>partition by key]
-        K[(Apache Kafka<br/>topic: events<br/>N partitions)]
-    end
-
-    subgraph Processing["Stream Processing"]
-        SP[PySpark Structured Streaming<br/>windowed aggregation]
-    end
-
-    subgraph Storage["Storage Layer"]
-        DL[(Data Lake / Parquet<br/>partitioned by date+hour)]
-        PG[(PostgreSQL<br/>serving tables + indexes)]
-    end
-
-    subgraph Serving["Serving Layer"]
-        API[FastAPI<br/>async endpoints]
-        CACHE[(Redis cache)]
-    end
-
-    DASH[Dashboards / Clients]
-
-    P1 --> PR
-    P2 --> PR
-    PR --> K
-    K --> SP
-    SP --> DL
-    SP --> PG
-    PG --> API
-    CACHE <--> API
-    API --> DASH
+    SRC --> N1 --> B --> N2
+    N2 --> S
+    N2 --> Q
+    S --> N3
+    N3 --> G
+    N3 --> OUT
+    G --> N4
+    G --> DASH
 ```
 
----
+Each object is stored under a visible, auditable prefix:
 
-## Data Flow
+```text
+bronze/events/ingestion_date=YYYY-MM-DD/batch_id=<id>/events.parquet
+silver/events/batch_id=<id>/events_clean.parquet
+quarantine/events/batch_id=<id>/rejected.parquet
+gold/daily_metrics/batch_id=<id>/daily_metrics.parquet
+processed/batch_id=<id>/events_processed.csv
+metadata/runs/<id>.json
+metadata/latest.json
+```
+
+## What the pipeline demonstrates
+
+| Stage | Behavior |
+|---|---|
+| Source | Accepts CSV, JSON, JSONL/NDJSON, or Parquet with `entity_id`, `metric`, `value`, and `ts` |
+| Bronze | Preserves source fields and adds batch, source, and ingestion metadata |
+| Silver | Standardizes fields, parses UTC timestamps and numbers, deduplicates events, and derives date/hour |
+| Quarantine | Separates invalid required fields instead of silently discarding them |
+| Gold | Produces daily event count, total value, unique entities, and average value by metric |
+| Processed | Delivers cleaned event-level data as CSV for a downstream system |
+| Metadata | Records row counts, object locations, timestamps, and latest-run state |
+| Dashboard | Reads the latest gold object from the same configured storage backend |
+
+## Quick start: free local demo
+
+Python 3.11 is recommended.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+
+# Run all medallion stages against the included source.
+python -m insightsstream.cli data\source\sample_events.csv
+
+# Inspect the dashboard.
+streamlit run dashboard\app.py
+
+# Or open and run notebooks 01 through 04 in order.
+jupyter lab
+```
+
+The generated lake is under `data/lakehouse/` and is intentionally ignored by Git.
+PySpark is the default CLI engine. A lightweight compatibility run is also available with `--engine pandas`.
+
+## Use your own source
+
+Provide a CSV, JSON, JSONL, or Parquet file containing:
+
+| Column | Meaning | Example |
+|---|---|---|
+| `entity_id` | User, device, or business entity | `user_001` |
+| `metric` | Event or measure name | `page_views` |
+| `value` | Numeric measure | `1` or `49.99` |
+| `ts` | ISO-8601 event timestamp | `2026-09-27T10:00:00Z` |
+
+Then run:
+
+```powershell
+python -m insightsstream.cli C:\path\to\your_events.csv
+```
+
+Column names are trimmed and lowercased. Invalid required values are written to quarantine, and repeated events
+with the same entity, metric, and timestamp are deduplicated in silver.
+
+## Free hosted storage: Cloudflare R2
+
+R2 is useful for a portfolio demo because it has an S3-compatible API and a web dashboard where the medallion
+prefixes and output objects can be inspected. Check Cloudflare's current pricing page before use because free-tier
+terms can change.
+
+1. Create an R2 bucket named `insightsstream` in the Cloudflare dashboard.
+2. Create an R2 API token with **Object Read & Write** access limited to that bucket.
+3. Copy `.env.example` to `.env`, but do not commit `.env`.
+4. Fill in the R2 values and change `INSIGHTS_STORAGE_BACKEND` to `r2`.
+5. Run the pipeline:
+
+```powershell
+python -m insightsstream.cli data\source\sample_events.csv
+streamlit run dashboard\app.py
+```
+
+The notebooks and dashboard automatically use R2 when these variables are present. A successful pipeline run will
+show the `bronze/`, `silver/`, `gold/`, `quarantine/`, `processed/`, and `metadata/` prefixes in the R2 web console.
+The repository does not connect to your R2 account until you provide these credentials locally. Credentials are
+never stored inside a notebook or source file.
+
+## Notebook walkthrough
+
+The optional Kafka notebook and the four medallion notebooks contain PySpark DataFrame operations and executable
+Spark SQL queries; they do not use Pandas.
+
+1. `notebooks/00_kafka_to_bronze.ipynb` — optionally consume Kafka micro-batches with Structured Streaming.
+2. `notebooks/01_bronze_ingestion.ipynb` — show/profile a file source with Spark SQL and land the raw batch.
+3. `notebooks/02_bronze_to_silver.ipynb` — clean, validate, deduplicate, and quarantine with Spark SQL.
+4. `notebooks/03_silver_to_gold.ipynb` — aggregate with Spark SQL and publish processed event data.
+5. `notebooks/04_gold_exploration.ipynb` — run KPI and ranking SQL over the latest gold dataset.
+
+Business logic lives in `insightsstream/spark_pipeline.py` rather than being duplicated across cells. This makes
+the notebooks easy to explain while keeping the PySpark pipeline testable and usable from an orchestrator or CI
+job. The Pandas implementation remains as a lightweight fallback for machines without Java.
+
+## Real-time streaming path
+
+The original streaming prototype remains available:
 
 ```mermaid
-sequenceDiagram
-    participant Src as Event Source
-    participant Prod as Kafka Producer
-    participant Kafka as Kafka (events topic)
-    participant Spark as PySpark Streaming
-    participant DB as PostgreSQL
-    participant API as FastAPI
-    participant User as Dashboard
-
-    Src->>Prod: emit event (JSON)
-    Prod->>Kafka: produce(key=entity_id, value=event)
-    Note over Kafka: Partitioned by key<br/>for ordered, parallel consumption
-    Kafka->>Spark: micro-batch poll
-    Spark->>Spark: parse + window (1-min tumbling)
-    Spark->>DB: upsert aggregated metrics (idempotent)
-    User->>API: GET /metrics?window=...
-    API->>DB: indexed query
-    API-->>User: JSON insights (cached)
+flowchart LR
+    P[Python event producer] --> K[(Kafka)]
+    K --> SP[PySpark Structured Streaming]
+    SP --> PG[(PostgreSQL)]
+    PG --> API[FastAPI]
+    API --> C[Clients]
+    API <--> R[(Redis)]
 ```
 
----
-
-## Component Design
-
-| Component | Responsibility | Key Choice |
-|-----------|----------------|------------|
-| **Producer** | Emit events, partition by `entity_id` | Keyed partitioning guarantees per-entity ordering |
-| **Kafka** | Durable, replayable event log | Decouples producers from consumers; absorbs spikes |
-| **PySpark Streaming** | Windowed aggregation, dedup | Checkpointing for exactly-once-ish semantics |
-| **PostgreSQL** | Serving store for aggregates | Composite indexes on `(metric, window_start)` |
-| **FastAPI** | Async, low-latency read API | Non-blocking I/O; Redis cache for hot queries |
-
----
-
-## Scalability Considerations
-
-```mermaid
-flowchart TB
-    subgraph Scale["Horizontal Scaling Strategy"]
-        direction LR
-        K1[(Kafka P0)] --> C1[Spark Executor 1]
-        K2[(Kafka P1)] --> C2[Spark Executor 2]
-        K3[(Kafka P2)] --> C3[Spark Executor 3]
-    end
-    C1 --> W[(Partitioned<br/>Write)]
-    C2 --> W
-    C3 --> W
-```
-
-- **Throughput scales with partitions** — add Kafka partitions and Spark executors together; each partition is
-  consumed by exactly one executor, so parallelism grows linearly.
-- **Backpressure** — Spark `maxOffsetsPerTrigger` caps intake per micro-batch to prevent executor OOM during spikes.
-- **Idempotent writes** — aggregates are `UPSERT`ed by `(metric, window_start)` so reprocessing after failure is safe.
-- **Storage partitioning** — Parquet partitioned by `date/hour` enables partition pruning and cheap retention drops.
-- **Read scaling** — Redis caches hot aggregate queries; PostgreSQL read replicas can be added behind the API.
-- **Stateless API** — FastAPI instances scale horizontally behind a load balancer.
-
----
-
-## Design Decisions
-
-| Decision | Why | Trade-off |
-|----------|-----|-----------|
-| **Kafka over direct DB writes** | Decouples ingest from processing; replayable; absorbs bursts | Added operational component |
-| **Structured Streaming over Kafka Streams** | Reuse Spark/PySpark skill set; unified batch + stream | Higher resource footprint |
-| **Tumbling windows** | Simple, deterministic per-minute metrics | Less flexible than session windows |
-| **PostgreSQL for serving** | Strong indexing + SQL for ad-hoc queries | Not ideal for >TB; would shard or move to OLAP later |
-| **Redis cache** | Sub-ms reads for hot dashboards | Cache invalidation complexity |
-| **Docker Compose** | One-command reproducible local stack | Not production orchestration (would use K8s) |
-
----
-
-## Tech Stack
-
-- **Ingestion:** Apache Kafka, `confluent-kafka` Python producer
-- **Processing:** PySpark Structured Streaming
-- **Storage:** PostgreSQL, Parquet data lake
-- **Serving:** FastAPI (async), Redis
-- **Infra:** Docker, Docker Compose
-- **Language:** Python 3.11
-
----
-
-## Local Setup
-
-```bash
-# 1. Start the full stack (Kafka, Spark, Postgres, Redis, API)
+```powershell
 docker compose up -d
-
-# 2. Start the event producer (simulates 1M+ events/day)
-python producer/produce_events.py
-
-# 3. Submit the streaming job
-python processing/stream_job.py
-
-# 4. Query insights
-curl "http://localhost:8000/metrics?metric=page_views&window=2026-06-28T10:00"
+python producer\produce_events.py
+python processing\stream_job.py
 ```
 
----
+See `docs/architecture.md` for how the batch and stream paths fit together.
 
-## Repository Structure
+## Test
 
-```
-insightsstream/
-├── README.md                 # this file (architecture + design)
-├── docker-compose.yml        # Kafka, Spark, Postgres, Redis, API
-├── requirements.txt
-├── producer/
-│   └── produce_events.py     # keyed Kafka producer
-├── processing/
-│   └── stream_job.py         # PySpark Structured Streaming aggregation
-├── api/
-│   └── main.py               # FastAPI serving layer
-└── docs/
-    ├── architecture.md       # deep-dive architecture notes
-    └── scalability.md        # capacity planning + benchmarks
+```powershell
+python -m pytest tests
 ```
 
----
+## Repository structure
 
-*Built to demonstrate large-scale data platform design: decoupled ingestion, horizontally scalable processing,
-idempotent storage, and a cached serving layer.*
+```text
+InsightsStream/
+├── insightsstream/          # PySpark pipeline, fallback pipeline, and storage adapters
+├── notebooks/               # Kafka, bronze, silver, gold, and SQL notebooks
+├── dashboard/app.py         # Streamlit dashboard
+├── data/source/             # committed example input only
+├── tests/                   # pipeline tests
+├── producer/                # Kafka event producer
+├── processing/              # PySpark streaming job
+├── api/                     # FastAPI serving API
+├── infra/                   # PostgreSQL initialization
+├── docs/                    # architecture and scalability details
+├── .env.example             # local/R2 configuration template
+└── requirements.txt
+```
