@@ -12,7 +12,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $env:DASHBOARD_PORT = $DashboardPort
 
-docker compose up -d --build zookeeper kafka minio notebook dashboard
+docker compose up -d --build zookeeper kafka minio notebook
 if ($LASTEXITCODE -ne 0) {
     throw "Docker Compose failed to start the local stack."
 }
@@ -45,6 +45,11 @@ docker compose exec -T notebook python -m insightsstream.delta_demo `
     --seed $Seed
 if ($LASTEXITCODE -ne 0) {
     throw "The local Delta pipeline failed."
+}
+
+docker compose up -d dashboard
+if ($LASTEXITCODE -ne 0) {
+    throw "Docker Compose failed to start the dashboard."
 }
 
 Write-Host ""
